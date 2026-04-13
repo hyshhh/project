@@ -1,4 +1,4 @@
-"""船弦号数据库 — 支持内置数据和外部 JSON 文件加载"""
+"""船弦号数据库 — FAISS 向量库 + 精确查找，标准 RAG 模式"""
 
 from __future__ import annotations
 
@@ -7,10 +7,11 @@ import logging
 from pathlib import Path
 from typing import Mapping
 
-import numpy as np
+from langchain_community.vectorstores import FAISS
+from langchain_core.documents import Document
 from langchain_openai import OpenAIEmbeddings
 
-from config import EmbedConfig
+from config import EmbedConfig, RetrievalConfig, VectorStoreConfig
 
 logger = logging.getLogger(__name__)
 
@@ -31,9 +32,30 @@ DEFAULT_SHIP_DB: dict[str, str] = {
 
 
 class ShipDatabase:
-    """管理弦号 → 描述映射，支持动态加载外部 JSON。"""
+    """
+    船弦号数据库 — 双通道检索：
+      1. 精确查找（dict，O(1)）
+      2. FAISS 向量语义检索（RAG）
 
-    def __init__(self, data: dict[str, str] | None = None, db_path: str | None = None):
+    每条记录 = Document(
+        page_content="弦号 {hn}\n{description}",   # 用于 embedding
+        metadata={"hull_number": hn, "description": desc}
+    )
+    """
+
+    def __init__(
+        self,
+        embed_config: EmbedConfig,
+        retrieval_config: RetrievalConfig,
+        vector_store_config: VectorStoreConfig,
+        data: dict[str, str] | None = None,
+        db_path: str | None = None,
+    ):
+        self._embed_config = embed_config
+        self._retrieval_config = retrieval_config
+        self._vs_config = vector_store_config
+
+        # ── 加载数据源 ──
         if db_path and Path(db_path).exists():
             self._data = self._load_json(db_path)
             logger.info("从 %s 加载了 %d 条船记录", db_path, len(self._data))
@@ -43,6 +65,18 @@ class ShipDatabase:
             self._data = dict(DEFAULT_SHIP_DB)
             logger.info("使用内置数据库，共 %d 条记录", len(self._data))
 
+        # ── Embedding 客户端 ──
+        self._embeddings = OpenAIEmbeddings(
+            model=self._embed_config.model,
+            api_key=self._embed_config.api_key,
+            base_url=self._embed_config.base_url,
+        )
+
+        # ── 向量库（懒加载） ──
+        self._vector_store: FAISS | None = None
+
+    # ── 数据加载 ──────────────────────────────
+
     @staticmethod
     def _load_json(path: str) -> dict[str, str]:
         with open(path, "r", encoding="utf-8") as f:
@@ -51,9 +85,96 @@ class ShipDatabase:
             raise ValueError(f"数据库文件格式错误，期望 dict，实际 {type(raw)}")
         return {str(k): str(v) for k, v in raw.items()}
 
+    # ── 向量库构建 ─────────────────────────────
+
+    def _build_documents(self) -> list[Document]:
+        """将所有船记录转为 Document 列表"""
+        docs = []
+        for hn, desc in self._data.items():
+            content = f"弦号 {hn}\n{desc}"
+            docs.append(Document(
+                page_content=content,
+                metadata={"hull_number": hn, "description": desc},
+            ))
+        return docs
+
+    def _load_or_build_vector_store(self) -> FAISS:
+        """尝试从磁盘加载缓存，不存在则重新构建"""
+        persist_dir = Path(self._vs_config.persist_path)
+        index_file = persist_dir / "index.faiss"
+
+        # 尝试加载缓存
+        if (
+            not self._vs_config.auto_rebuild
+            and index_file.exists()
+        ):
+            try:
+                logger.info("从 %s 加载向量库缓存…", persist_dir)
+                vs = FAISS.load_local(
+                    str(persist_dir),
+                    self._embeddings,
+                    allow_dangerous_deserialization=True,
+                )
+                logger.info("向量库缓存加载成功")
+                return vs
+            except Exception as e:
+                logger.warning("缓存加载失败（%s），将重新构建", e)
+
+        # 构建新索引
+        docs = self._build_documents()
+        logger.info("正在构建 FAISS 向量库（%d 条文档）…", len(docs))
+        vs = FAISS.from_documents(docs, self._embeddings)
+
+        # 持久化
+        persist_dir.mkdir(parents=True, exist_ok=True)
+        vs.save_local(str(persist_dir))
+        logger.info("向量库已持久化到 %s", persist_dir)
+
+        return vs
+
+    @property
+    def vector_store(self) -> FAISS:
+        if self._vector_store is None:
+            self._vector_store = self._load_or_build_vector_store()
+        return self._vector_store
+
+    # ── 精确查找 ──────────────────────────────
+
     def lookup(self, hull_number: str) -> str | None:
         """精确查找，返回描述或 None。"""
         return self._data.get(hull_number.strip())
+
+    # ── 语义检索 ──────────────────────────────
+
+    def semantic_search(self, query: str, top_k: int | None = None) -> list[dict]:
+        """
+        FAISS 语义检索，返回 [
+            {"hull_number": str, "description": str, "score": float},
+            ...
+        ]
+        score 为归一化相似度，越高越匹配。
+        """
+        k = top_k or self._retrieval_config.top_k
+        results_with_score = self.vector_store.similarity_search_with_score(query, k=k)
+
+        results = []
+        for doc, distance in results_with_score:
+            # FAISS 内积距离 → 相似度（值越小越相似，转为 0~1）
+            score = 1.0 / (1.0 + distance)
+            results.append({
+                "hull_number": doc.metadata["hull_number"],
+                "description": doc.metadata["description"],
+                "score": round(score, 4),
+            })
+        return results
+
+    def semantic_search_filtered(self, query: str) -> list[dict]:
+        """带阈值过滤的语义检索"""
+        results = self.semantic_search(query, top_k=self._retrieval_config.top_k)
+        threshold = self._retrieval_config.score_threshold
+        return [r for r in results if r["score"] >= threshold]
+
+    # ── 属性 ──────────────────────────────────
 
     @property
     def hull_numbers(self) -> list[str]:
@@ -69,47 +190,3 @@ class ShipDatabase:
 
     def __len__(self) -> int:
         return len(self._data)
-
-
-class EmbeddingIndex:
-    """文档向量索引 — 懒加载，只调用一次 embedding API。"""
-
-    def __init__(self, config: EmbedConfig, descriptions: list[str]):
-        self._config = config
-        self._descriptions = descriptions
-        self._client: OpenAIEmbeddings | None = None
-        self._matrix: np.ndarray | None = None
-
-    def _ensure_client(self) -> OpenAIEmbeddings:
-        if self._client is None:
-            self._client = OpenAIEmbeddings(
-                model=self._config.model,
-                api_key=self._config.api_key,
-                base_url=self._config.base_url,
-            )
-        return self._client
-
-    def _ensure_index(self) -> np.ndarray:
-        if self._matrix is None:
-            logger.info("正在构建 embedding 索引（%d 条文档）…", len(self._descriptions))
-            client = self._ensure_client()
-            embs = client.embed_documents(self._descriptions)
-            self._matrix = np.array(embs, dtype=np.float32)
-            logger.info("索引构建完成，shape=%s", self._matrix.shape)
-        return self._matrix
-
-    def search(self, query: str, top_k: int = 1) -> list[tuple[int, float]]:
-        """
-        语义检索，返回 [(index, score), ...] 按 score 降序。
-        """
-        client = self._ensure_client()
-        query_emb = np.array(client.embed_query(query), dtype=np.float32)
-        doc_matrix = self._ensure_index()
-
-        # cosine similarity
-        q_norm = query_emb / (np.linalg.norm(query_emb) + 1e-10)
-        d_norms = doc_matrix / (np.linalg.norm(doc_matrix, axis=1, keepdims=True) + 1e-10)
-        scores = d_norms @ q_norm
-
-        top_indices = np.argsort(scores)[::-1][:top_k]
-        return [(int(i), float(scores[i])) for i in top_indices]

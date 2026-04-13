@@ -1,13 +1,15 @@
 [project]
 name = "ship-hull-agent"
-version = "0.1.0"
-description = "船弦号识别 Agent — 精确匹配 + 语义检索"
+version = "0.2.0"
+description = "船弦号识别 Agent — 精确匹配 + FAISS 语义检索（RAG）"
 requires-python = ">=3.10"
 dependencies = [
     "langchain-core>=0.3.0",
     "langchain-openai>=0.3.0",
+    "langchain-community>=0.4.0",
     "langgraph>=0.3.0",
     "numpy>=1.24",
+    "faiss-cpu>=1.7",
     "pydantic>=2.0",
     "pydantic-settings>=2.0",
     "rich>=13.0",
