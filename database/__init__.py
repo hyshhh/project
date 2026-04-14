@@ -9,11 +9,41 @@ from typing import Mapping
 
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
-from langchain_openai import OpenAIEmbeddings
-
+from langchain_core.embeddings import Embeddings
 from config import EmbedConfig, RetrievalConfig, VectorStoreConfig
 
 logger = logging.getLogger(__name__)
+
+
+class DashScopeEmbeddings(Embeddings):
+    """DashScope Embedding 封装，直接调用 OpenAI 兼容模式 API。"""
+
+    def __init__(self, model: str, api_key: str, base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"):
+        self.model = model
+        self.api_key = api_key
+        self._url = f"{base_url.rstrip('/')}/embeddings"
+        self._headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        import httpx
+        resp = httpx.post(
+            self._url,
+            headers=self._headers,
+            json={"model": self.model, "input": texts},
+            timeout=60,
+        )
+        if resp.status_code != 200:
+            logger.error("DashScope embedding 请求失败 [%d]: %s", resp.status_code, resp.text)
+        resp.raise_for_status()
+        data = resp.json()
+        return [item["embedding"] for item in data["data"]]
+
+    def embed_query(self, text: str) -> list[float]:
+        return self.embed_documents([text])[0]
+
 
 # ── 内置默认数据库 ──────────────────────────────
 
@@ -27,7 +57,8 @@ DEFAULT_SHIP_DB: dict[str, str] = {
     "0512": "黄色挖泥船，船体宽大，中部有大型绞吸臂",
     "0678": "蓝色油轮，双壳结构，船尾有大型舵机舱",
     "0789": "白色科考船，船尾有A型吊架，甲板有多个实验室舱",
-    "0901": "黑色滚装船，船尾有巨大跳板，侧舷有汽车装载门",
+    # "0901": "黑色滚装船，船尾有巨大跳板，侧舷有汽车装载门",
+    "0921": "黑色",
 }
 
 
@@ -66,7 +97,7 @@ class ShipDatabase:
             logger.info("使用内置数据库，共 %d 条记录", len(self._data))
 
         # ── Embedding 客户端 ──
-        self._embeddings = OpenAIEmbeddings(
+        self._embeddings = DashScopeEmbeddings(
             model=self._embed_config.model,
             api_key=self._embed_config.api_key,
             base_url=self._embed_config.base_url,

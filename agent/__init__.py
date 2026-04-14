@@ -106,20 +106,21 @@ class ShipHullAgent:
             model=self._llm,
             tools=self.tools,
             prompt=SYSTEM_PROMPT,
-            state_modifier=FEW_SHOT_EXAMPLES,
         )
 
     def run(self, query: str) -> str:
         """执行一次识别查询，返回最终回答文本。"""
         logger.info("收到查询: %s", query)
-        result = self._agent.invoke({"messages": [("user", query)]})
+        messages = FEW_SHOT_EXAMPLES + [HumanMessage(content=query)]
+        result = self._agent.invoke({"messages": messages})
         answer = result["messages"][-1].content
         logger.info("回答: %s", answer)
         return answer
 
     def run_verbose(self, query: str) -> list[dict]:
         """执行查询，返回完整消息链（调试用）。"""
-        result = self._agent.invoke({"messages": [("user", query)]})
+        messages = FEW_SHOT_EXAMPLES + [HumanMessage(content=query)]
+        result = self._agent.invoke({"messages": messages})
         trace = []
         for msg in result["messages"]:
             entry = {"type": msg.type, "content": msg.content}
